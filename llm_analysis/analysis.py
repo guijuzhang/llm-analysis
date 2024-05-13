@@ -461,6 +461,7 @@ class LLMAnalysis:
             tuple: a tuple of the memory (in bytes) required to store the optimizer states and gradients of a transformer layer
         """
 
+        # Grace: stage1 - optimizer  -> ZeroOne paper
         if ds_zero >= DSZeRO.STAGE_1:
             sharded_dp_size = self.parallelism_config.dp_size
             mlp_sharded_dp_size = self.parallelism_config.dp_size / self.parallelism_config.ep_size
@@ -473,6 +474,8 @@ class LLMAnalysis:
         else:
             op_bytes_per_params = (other_op_bytes + master_weights_dtype_bytes)
 
+        # Grace: 12 bytes is most common, compared to 2 bytes for weights
+        # but it can be optimized by ZeroOne greatly (/dp_size)
         memory_optimizer_state_mlp_per_layer = op_bytes_per_params * self.get_num_params_per_layer_mlp(
         ) / self.parallelism_config.ep_size / self.parallelism_config.tp_size / mlp_sharded_dp_size
 
@@ -484,6 +487,8 @@ class LLMAnalysis:
 
         memory_optimizer_state_per_layer = memory_optimizer_state_mlp_per_layer + memory_optimizer_state_others_per_layer
 
+
+        # stage2 - gradient  -> ZeroOne paper
         if ds_zero >= DSZeRO.STAGE_2:
             sharded_dp_size = self.parallelism_config.dp_size
             mlp_sharded_dp_size = self.parallelism_config.dp_size / self.parallelism_config.ep_size
@@ -985,6 +990,7 @@ class LLMAnalysis:
         num_flops_logit_layer = (2 * batch_size * seq_len * hidden_dim *
                                  vocab_size)  # logit compute
 
+        # Grace: important point
         num_flops_fwd_total = (
             self.get_num_flops_fwd_per_layer(batch_size, seq_len) * num_layers
             + num_flops_logit_layer)
@@ -1014,6 +1020,11 @@ class LLMAnalysis:
         Returns:
             int: the number of floating point operations for the backward pass of the entire transformer
         """
+        # Grace: explained why multiply 2
+        # matmul is maincost. matrix A (x, y) @ matric B (y, z) => (x, z), flops is 2xyz. 
+        # dA = dC @ transpose(B)   (x, z) @ (z, y) = (x, y)
+        # dB = transpose(A) @ dC   (y, x) @ (x, z)  = (y, z)
+        
         return 2 * self.get_num_flops_fwd_total(batch_size, seq_len)
 
     def get_num_flops_total_attn_compute(self, batch_size: int,
@@ -1203,9 +1214,13 @@ class LLMAnalysis:
         if tp_size == 1:
             return 0
 
+        # Grace: check ring all reduce
+        # think about how to ring all gather and ring reduce-scatter
         elems_per_all_reduce = (2 * batch_size * seq_len *
                                 self.model_config.hidden_dim * (tp_size - 1) /
                                 tp_size)
+        
+        # Grace: here it assume 100% untilization and  assume intra node communication only
         latency_per_all_reduce = (
             elems_per_all_reduce * dtype_bytes /
             (self.gpu_config.intra_node_bandwidth_in_GB_per_sec * 10**9))
@@ -1231,6 +1246,9 @@ class LLMAnalysis:
             self.get_num_params_per_layer_layernorm()
         ) * self.dtype_config.weight_bits / BITS_PER_BYTE
 
+        # Grace: common practice is to put data parallelism on inter nodes, an put tensor parallesim on intra nodes
+        # here it uses "if dp_size <= 8" is unreasonable
+        # and think about why it uses all gather here
         latency_allgather_params_mlp = time_allgather(
             params_bytes_mlp, dp_size / ep_size,
             (self.get_intra_node_bandwidth()
@@ -1294,6 +1312,7 @@ class LLMAnalysis:
             f"latency_fwd_per_layernorm: {round(latency_fwd_per_layernorm*1000, 3)} ms"
         )
 
+
         latency_fwd_per_tp_comm = self.get_latency_fwd_per_tp_comm(
             batch_size,
             seq_len,
@@ -1306,6 +1325,8 @@ class LLMAnalysis:
         latency_fwd_per_layer_shared_dp_comm = self.get_latency_fwd_per_layer_shared_dp_comm(
         )
 
+
+        # Grace: there's layernorm and all reduce after attn and mlp, thus layernorm * 2, all reduce * 2
         latency_per_layer = latency_fwd_per_layer_attn + latency_fwd_per_layer_mlp + 2 * latency_fwd_per_layernorm + 2 * latency_fwd_per_tp_comm
 
         if ds_zero > DSZeRO.STAGE_1 and latency_fwd_per_layer_shared_dp_comm > latency_per_layer:
@@ -1419,12 +1440,14 @@ class LLMAnalysis:
 
         latency_fwd_layers = latency_fwd_per_layer * num_layers_per_gpu
 
+        # Grace: small, skip
         latency_fwd_input_embedding = self.get_latency_fwd_input_embedding(
             batch_size,
             seq_len,
             dtype_bytes=self.dtype_config.embedding_bits / BITS_PER_BYTE,
         )
 
+        # Grace: small, skip
         latency_fwd_output_embedding_loss = (
             self.get_latency_fwd_output_embedding_loss(batch_size, seq_len))
 
@@ -1612,6 +1635,9 @@ class LLMAnalysis:
             is_inference=True,
             layernorm_dtype_bytes=layernorm_dtype_bytes,
         )
+
+        # Grace: low cost, don't care
+        # Grace: prefill_### are inference related,  skip for now.
         prefill_activation_memory_embedding_output_batch_size_1 = self.get_activation_memory_output_embedding(
             1, seq_len)
 
@@ -1663,6 +1689,8 @@ class LLMAnalysis:
             breakdown_prefix="prefill_",
         )
 
+
+        # Grace: kv_cache is inference related, skip for now
         if use_kv_cache:
             if (batch_size_per_gpu *
                 (seq_len + num_tokens_to_generate) < self.get_pivot()):
@@ -1715,6 +1743,8 @@ class LLMAnalysis:
                 " decode_max_batch_size_per_gpu:"
                 f" {decode_max_batch_size_per_gpu}")
         else:
+
+            # Grace:  decode_### is inference related, skip for now
             decode_max_batch_size_per_gpu = int(
                 memory_left / prefill_activation_memory_batch_size_1)
             logger.info("decode_activation_memory_batch_size_1:"
@@ -1930,6 +1960,9 @@ class LLMAnalysis:
             gradient_accumulation_steps = (1 if
                                            gradient_accumulation_steps is None
                                            else gradient_accumulation_steps)
+            
+            # Grace: why not multiply microbatch_num (pipeline parallelism)
+            # Grace: pipeline parallelism is suitale for thousands of gpus,not suitable for hunreds or less 
             global_batch_size = (batch_size_per_gpu *
                                  gradient_accumulation_steps *
                                  self.parallelism_config.dp_size)
@@ -2030,6 +2063,7 @@ class LLMAnalysis:
                                  weight_memory_layers_per_gpu +
                                  weight_memory_last_layernorm)
 
+        # optimizer state memory
         optimizer_state_memory_per_layer, gradient_memory_per_layer = self.get_memory_optimizer_state_and_gradient_per_layer(
             master_weights_dtype_bytes, other_op_bytes, ds_zero)
 
@@ -2109,6 +2143,11 @@ class LLMAnalysis:
             f"activation_memory for micro batch size 1: {_num_to_string(activation_memory_batch_size_1)}B, max_batch_size_per_gpu: {max_batch_size_per_gpu}"
         )
 
+
+        # 05/10 
+
+        # Grace: this function is to find out the relationship between below numbers. 
+        # eg use batch_size_per_gpu if it's specified, else use other parameters to calculate batch_size_per_gpu
         (
             batch_size_per_gpu,
             gradient_accumulation_steps,
@@ -2123,6 +2162,7 @@ class LLMAnalysis:
         if batch_size_per_gpu == 1:
             activation_memory_per_gpu, activation_memory_attn_per_gpu, activation_memory_mlp_per_gpu, activation_memory_layernorm_per_gpu = activation_memory_batch_size_1, activation_memory_attn_batch_size_1, mlp_activation_memory_batch_size_1, layernorm_activation_memory_batch_size_1
         else:
+            # Grace: not important, skip
             activation_memory_per_gpu, activation_memory_attn_per_gpu, activation_memory_mlp_per_gpu, activation_memory_layernorm_per_gpu = [
                 x * self.model_config.num_layers
                 for x in self.get_activation_memory_per_layer(
@@ -2229,7 +2269,10 @@ class LLMAnalysis:
         elif activation_recomputation == ActivationRecomputation.NONE:
             latency_recompute = 0
 
+
+        # Grace: assume backward = fwd * 2, it's too brutal
         latency_per_micro_batch = latency_fwd * 3 + latency_recompute
+        # Grace: small, ignore
         latency_weight_update = self.get_latency_weight_update()
         latency_per_iter = (
             latency_per_micro_batch * gradient_accumulation_steps +
@@ -2396,6 +2439,7 @@ class LLMAnalysis:
                                      print_human_readable=True,
                                      output_file_suffix=output_file_suffix)
 
+        # Grace: it doesn't calculate pp communication latency, and pp bubble
         return summary_dict
 
 
